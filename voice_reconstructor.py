@@ -1,7 +1,9 @@
+import sys
 import numpy as np
 import sounddevice as sd
 from scipy.fft import fft
-import time
+from PyQt5 import QtCore, QtWidgets
+import pyqtgraph as pg
 
 # --- 設定 ---
 FS = 44100  # サンプリングレート
@@ -11,71 +13,118 @@ ANALYSIS_WINDOW = 0.05  # 解析する時間幅 (秒)
 NUM_PEAKS = 100  # 抽出するピーク数
 STEP_DURATION = 0.5  # 各ステップの再生時間 (秒)
 
-print("録音を開始します...")
-# --- 1. 録音 ---
-recording = sd.rec(int(DURATION_REC * FS), samplerate=FS, channels=1, dtype='float32')
-sd.wait()  # 録音終了まで待機
-print("録音完了。")
+class VoiceSpectrumVisualizer(QtWidgets.QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Voice Spectrum Synthesis Visualizer")
+        self.resize(800, 600)
 
-# データを1次元に変換
-audio_data = recording.flatten()
+        # PyQTGraphの設定
+        self.central_widget = QtWidgets.QWidget()
+        self.setCentralWidget(self.central_widget)
+        self.layout = QtWidgets.QVBoxLayout(self.central_widget)
+        self.plot_widget = pg.PlotWidget()
+        self.layout.addWidget(self.plot_widget)
+        
+        # グラフ軸の設定
+        self.plot_widget.setLabel('left', 'Amplitude')
+        self.plot_widget.setLabel('bottom', 'Frequency [Hz]')
+        self.plot_widget.setTitle("Adding Frequencies to Spectrum")
+        self.plot_widget.setXRange(0, 4000) # 人の声の主要範囲を表示
+        self.plot_widget.setYRange(0, 0.05) # 振幅の最大値に合わせて調整
 
-# --- 2. 特定時点の解析 ---
-start_idx = int(TARGET_TIME * FS)
-end_idx = start_idx + int(ANALYSIS_WINDOW * FS)
-window_data = audio_data[start_idx:end_idx]
+        # 解析データの準備
+        self.top_freqs = None
+        self.top_amps = None
+        self.top_phases = None
+        self.current_step = 0
+        
+        # 表示用のバーグラフオブジェクトを初期化
+        self.bar_graph = pg.BarGraphItem(x=[], height=[], width=20, brush='y')
+        self.plot_widget.addItem(self.bar_graph)
 
-# FFTを実行
-n = len(window_data)
-fft_data = fft(window_data)
-freqs = np.fft.fftfreq(n, 1/FS)
+        # 録音・解析の開始
+        self.prepare_data()
 
-# 振幅と位相を計算
-amplitudes = np.abs(fft_data) * 2 / n
-phases = np.angle(fft_data)
+        # タイマー設定 (0.5秒ごとにデータを更新)
+        self.timer = QtCore.QTimer()
+        self.timer.timeout.connect(self.update_spectrum_and_sound)
+        self.timer.start(int(STEP_DURATION * 1000))
 
-# 正の周波数成分のみに限定
-pos_mask = freqs > 0
-freqs = freqs[pos_mask]
-amplitudes = amplitudes[pos_mask]
-phases = phases[pos_mask]
+    def prepare_data(self):
+        print("録音を開始します...")
+        recording = sd.rec(int(DURATION_REC * FS), samplerate=FS, channels=1, dtype='float32')
+        sd.wait()
+        print("録音完了。解析中...")
+        audio_data = recording.flatten()
 
-# --- 3. ピークの抽出 (上位100個) ---
-# 振幅が大きい順にインデックスをソート
-sorted_indices = np.argsort(amplitudes)[::-1]
-top_indices = sorted_indices[:NUM_PEAKS]
+        # 解析対象の取得
+        start_idx = int(TARGET_TIME * FS)
+        end_idx = start_idx + int(ANALYSIS_WINDOW * FS)
+        window_data = audio_data[start_idx:end_idx]
 
-top_freqs = freqs[top_indices]
-top_amps = amplitudes[top_indices]
-top_phases = phases[top_indices]
+        # FFT
+        n = len(window_data)
+        fft_data = fft(window_data)
+        freqs = np.fft.fftfreq(n, 1/FS)
+        amplitudes = np.abs(fft_data) * 2 / n
+        phases = np.angle(fft_data)
 
-# --- 4. 音声の段階的な合成と再生 ---
-print(f"振幅が大きい順に {NUM_PEAKS} 個のサイン波を追加して再生します。")
-t = np.linspace(0, STEP_DURATION, int(FS * STEP_DURATION), endpoint=False)
-current_wave = np.zeros_like(t)
+        # 正の周波数成分
+        pos_mask = freqs > 0
+        freqs = freqs[pos_mask]
+        amplitudes = amplitudes[pos_mask]
+        phases = phases[pos_mask]
 
-for i in range(NUM_PEAKS):
-    f = top_freqs[i]
-    a = top_amps[i]
-    p = top_phases[i]
-    
-    # サイン波を追加
-    current_wave += a * np.sin(2 * np.pi * f * t + p)
-    
-    # 振幅を正規化（音が割れないように）
-    max_amp = np.max(np.abs(current_wave))
-    if max_amp > 0:
-        normalized_wave = current_wave / max_amp
-    else:
-        normalized_wave = current_wave
-    
-    print(f"Step {i+1}/100: 周波数 {f:.1f}Hz を追加中...")
-    
-    # 再生
-    sd.play(normalized_wave, FS)
-    sd.wait()
-    
-    # 再生時間分待機
-    time.sleep(0.1) 
+        # ピークの抽出
+        sorted_indices = np.argsort(amplitudes)[::-1]
+        top_indices = sorted_indices[:NUM_PEAKS]
 
-print("全ステップ終了。")
+        self.top_freqs = freqs[top_indices]
+        self.top_amps = amplitudes[top_indices]
+        self.top_phases = phases[top_indices]
+        
+        # 音合成用の時間軸
+        self.t_sound = np.linspace(0, STEP_DURATION, int(FS * STEP_DURATION), endpoint=False)
+        self.current_wave = np.zeros_like(self.t_sound)
+        
+        print("合成を開始します。")
+
+    def update_spectrum_and_sound(self):
+        if self.current_step < NUM_PEAKS:
+            # 1. グラフの更新 (スペクトル)
+            # 現在のステップまでの周波数と振幅を取得
+            freqs_to_plot = self.top_freqs[:self.current_step + 1]
+            amps_to_plot = self.top_amps[:self.current_step + 1]
+            
+            # バーグラフのデータを更新
+            self.bar_graph.setOpts(x=freqs_to_plot, height=amps_to_plot)
+            
+            # 2. 音声合成と再生
+            f = self.top_freqs[self.current_step]
+            a = self.top_amps[self.current_step]
+            p = self.top_phases[self.current_step]
+            
+            # 波形は全合成波の累積ではなく、このステップの音だけを鳴らすか、
+            # 前回のプログラムのように全合成波を鳴らすか選べますが、
+            # 「追加される様子」を聞くため、ここでも全合成波を流します
+            self.current_wave += a * np.sin(2 * np.pi * f * self.t_sound + p)
+            
+            # 正規化
+            max_amp = np.max(np.abs(self.current_wave))
+            normalized_wave = self.current_wave / max_amp if max_amp > 0 else self.current_wave
+            
+            # 音声再生
+            sd.play(normalized_wave, FS)
+            
+            print(f"Step {self.current_step+1}/{NUM_PEAKS}: Freq {f:.1f}Hz added.")
+            self.current_step += 1
+        else:
+            self.timer.stop()
+            print("完了。")
+
+if __name__ == '__main__':
+    app = QtWidgets.QApplication(sys.argv)
+    window = VoiceSpectrumVisualizer()
+    window.show()
+    sys.exit(app.exec_())
